@@ -1,0 +1,12 @@
+import px
+
+stack_traces = px.DataFrame(table='stack_traces.beta', start_time='-5m')
+stack_traces.deployment = stack_traces.ctx['deployment']
+# Filter out stack traces to just the go service we are trying to deploy
+stack_traces = stack_traces[stack_traces.deployment == 'pl/vizier-cloud-connector']
+stack_traces.asid = px.asid()
+sample_period = px.GetProfilerSamplingPeriodMS()
+df = stack_traces.merge(sample_period, how='inner', left_on=['asid'], right_on=['asid'])
+df = df.groupby(['profiler_sampling_period_ms']).agg(pprof=('stack_trace', 'count', 'profiler_sampling_period_ms', px.pprof))
+df.pprof = px.bytes_to_hex(df.pprof)
+px.display(df)
