@@ -1,4 +1,4 @@
-## Faster Go application with Dagger and Pixie
+## Faster Go applications with Dagger and Pixie
 
 Go has supported Profile Guided Optimization (PGO) since version 1.20, which allows you to optimize your Go applications based on profiling data. This can lead to significant performance improvements, especially for CPU-bound applications.
 
