@@ -45,7 +45,7 @@ $ docker cp ${container_id}:/app/src/vizier/services/cloud_connector/cloud_conne
 ```
 - Collect the pprof data through Pixie -- `px run -f pprof_export.pxl -o json > input.json`
 - Convert the JSON file into a binary pprof file that Dagger can use -- `./convert-flame-graph-hex-to-binary.sh input.json input.pprof`
-- Run Dagger to transform the input into a PGO compatible profile -- `dagger call -d  copy-file --pprof=input.pprof --binary  application_binary`
+- Run Dagger to transform the input into a PGO compatible profile -- `dagger call -d  copy-file --pprof=input.pprof  export --path processed.pprof`
 - View Dagger trace to see that the pprof functions are being annotated properly (see logs collected from adhoc run)
 
 ```

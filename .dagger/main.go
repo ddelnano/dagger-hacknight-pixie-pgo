@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"dagger/hello-dagger/internal/dagger"
+	"debug/buildinfo"
 	"debug/elf"
 	"debug/gosym"
 	"fmt"
@@ -26,13 +27,49 @@ import (
 	"github.com/google/pprof/profile"
 )
 
+const (
+	goAppBinary    = "application_binary"
+	outputFilepath = "output.pprof"
+	containerImage = "gcr.io/pixie-oss/pixie-prod/vizier-cloud_connector_server_image:0.14.15"
+)
+
 // TODO(ddelnano): Rename module
 type HelloDagger struct{}
 
+func (m *HelloDagger) GetApplicationBinary(ctx context.Context, containerImage string) (*dagger.File, error) {
+	entrypoints, err := dag.Container().
+		From(containerImage).
+		Entrypoint(ctx)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get entrypoint: %w", err)
+	}
+
+	if len(entrypoints) != 1 {
+		return nil, fmt.Errorf("expected exactly one entrypoint, received %v", entrypoints)
+	}
+
+	return dag.Container().
+		From(containerImage).
+		File(entrypoints[0]), nil
+}
+
 // TODO(ddelnano): Remove CopyFile to something more meaningful
-func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File, binary *dagger.File) {
+func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File) (*dagger.File, error) {
 	pprof.Export(ctx, "input.pprof")
-	binary.Export(ctx, "application_binary")
+	binary, err := m.GetApplicationBinary(ctx, containerImage)
+	if err != nil {
+		log.Fatal(err)
+	}
+	binary.Export(ctx, goAppBinary)
+
+	info, err := buildinfo.ReadFile(goAppBinary)
+
+	if err != nil {
+		// Container binary is not a Go binary, this pprof module is not applicable.
+		log.Fatal(err)
+	}
+	fmt.Printf("Build info go version: %s\n", info.GoVersion)
 
 	var (
 		textStart = uint64(0)
@@ -54,7 +91,7 @@ func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File, binary *
 	}
 	// your custom logic here
 	// Read in the ELF file
-	f, err := elf.Open("application_binary")
+	f, err := elf.Open(goAppBinary)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -127,7 +164,17 @@ func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File, binary *
 		}
 	}
 
-	// TODO(ddelnano): Write out pprof file after updates
+	processed, err := os.OpenFile(outputFilepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = p.WriteUncompressed(processed)
+	if err != nil {
+		log.Fatal(err)
+	}
+	processedPprof := dag.CurrentModule().WorkdirFile(outputFilepath)
+	processedPprof.Export(ctx, outputFilepath)
+	return processedPprof, nil
 }
 
 func runtimeTextAddr(f *elf.File) (uint64, bool) {
