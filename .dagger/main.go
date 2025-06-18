@@ -20,21 +20,144 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"debug/gosym"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/google/pprof/profile"
+	"px.dev/pxapi"
+	"px.dev/pxapi/types"
 )
 
 const (
 	goAppBinary    = "application_binary"
 	outputFilepath = "output.pprof"
 	containerImage = "gcr.io/pixie-oss/pixie-prod/vizier-cloud_connector_server_image:0.14.15"
+	pxlTmpl        = `
+import px
+
+stack_traces = px.DataFrame(table='stack_traces.beta', start_time='-5m')
+stack_traces.deployment = stack_traces.ctx['deployment']
+# Filter out stack traces to just the go service we are trying to deploy
+stack_traces = stack_traces[stack_traces.deployment == '%s']
+stack_traces.asid = px.asid()
+sample_period = px.GetProfilerSamplingPeriodMS()
+df = stack_traces.merge(sample_period, how='inner', left_on=['asid'], right_on=['asid'])
+df = df.groupby(['profiler_sampling_period_ms']).agg(pprof=('stack_trace', 'count', 'profiler_sampling_period_ms', px.pprof))
+df.pprof = px.bytes_to_hex(df.pprof)
+px.display(df)
+`
 )
+
+type PprofMuxer struct {
+	results     chan string
+	resultCount int
+}
+
+func NewPprofMuxer(c chan string) *PprofMuxer {
+	return &PprofMuxer{
+		results:     c,
+		resultCount: 0,
+	}
+}
+
+var _ pxapi.TableMuxer = (*PprofMuxer)(nil)
+
+func (m *PprofMuxer) AcceptTable(ctx context.Context, metadata types.TableMetadata) (pxapi.TableRecordHandler, error) {
+	if metadata.IndexOf("pprof") == -1 {
+		return m, errors.New("expected pxl results table to contain 'pprof' column")
+	}
+	return m, nil
+}
+
+var _ pxapi.TableRecordHandler = (*PprofMuxer)(nil)
+
+func (m *PprofMuxer) HandleInit(ctx context.Context, metadata types.TableMetadata) error {
+	return nil
+}
+
+func (m *PprofMuxer) HandleRecord(ctx context.Context, record *types.Record) error {
+	m.resultCount++
+	if m.resultCount > 1 {
+		return fmt.Errorf("expected exactly one row from pprof table, got %d", len(record.Data))
+	}
+	datum := record.GetDatum("pprof")
+	m.results <- datum.String()
+
+	return nil
+}
+
+func (m *PprofMuxer) HandleDone(ctx context.Context) error {
+	close(m.results)
+	return nil
+}
 
 // TODO(ddelnano): Rename module
 type HelloDagger struct{}
+
+func (m *HelloDagger) CollectProfile(
+	ctx context.Context,
+	// +default="getcosmic.ai:443"
+	cloudAddr,
+	vizierId,
+	deploymentName string,
+	apiKey *dagger.Secret,
+) (*dagger.File, error) {
+	fmt.Println("CollectProfile called with pxCloudAddr:", cloudAddr, "and deploymentName:", deploymentName)
+	apiKeyPlaintext, err := apiKey.Plaintext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get plaintext API key: %v", err)
+	}
+
+	client, err := pxapi.NewClient(ctx, pxapi.WithCloudAddr(cloudAddr), pxapi.WithAPIKey(apiKeyPlaintext))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Pixie API client: %v", err)
+	}
+
+	vzClient, err := client.NewVizierClient(ctx, vizierId)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Vizier client: %v", err)
+	}
+
+	pprof := make(chan string, 1)
+	mux := NewPprofMuxer(pprof)
+	results, err := vzClient.ExecuteScript(ctx, fmt.Sprintf(pxlTmpl, deploymentName), mux)
+
+	if err != nil {
+		return nil, err
+	}
+
+	err = results.Stream()
+
+	if err != nil {
+		return nil, err
+	}
+	defer results.Close()
+
+	pprofHex := <-pprof
+
+	// TODO(ddelnano): The pxl script converts the pprof binary into hex, resulting in
+	// this Go code needing to decode the hex string. Investigate if we can avoid this
+	// and have the pxapi return the pprof binary directly.
+	cleaned := strings.ReplaceAll(pprofHex, "\\x", "")
+	bytes, err := hex.DecodeString(cleaned)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode hex string: %v", err)
+	}
+
+	err = os.WriteFile("raw.pprof", bytes, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pprofFile := dag.CurrentModule().WorkdirFile("raw.pprof")
+	pprofFile.Export(ctx, "raw.pprof")
+	return pprofFile, nil
+}
 
 func (m *HelloDagger) GetApplicationBinary(ctx context.Context, containerImage string) (*dagger.File, error) {
 	entrypoints, err := dag.Container().
