@@ -20,32 +20,16 @@ To summarize, Pixie is used to capture non-PGO capatible CPU profiles. Since Pix
 At this time, the Dagger integration is still incomplete see the TODO list below for the remaining steps to complete the integration. The Instructions section below will be updated as the outstanding todos are completed.
 
 ## TODO
-- [ ] Add the `px` cli run and pprof hex transformation to the Dagger pipeline
-- [ ] Add Dagger step to collect the application binary (use Pixie to find deployment image, pull image and grab the Entrypoint binary)
-- [ ] Parameterize the `pprof_export.pxl` function so users can supply their own deployment name (current script hardcode's a Pixie Go service)
-- [ ] Add Dagger step to write out new pprof file
 - [ ] Add Dagger step to push the new binary to the k8s cluster
 
-
 ## Prerequisites
-- px cli installed -- follow the instructions [here](https://docs.px.dev/installing-pixie/install-schemes/cli/) to install the px cli.
 - A k8s cluster with Pixie installed -- the cli instructions from above will also install Pixie on your cluster.
 - Dagger installed -- follow the instructions [here](https://docs.dagger.io/install) to install Dagger.
 
-
 ## Instructions
-- Collect the application binary from the k8s cluster. This step will be later automated.
-```bash
-$ kubectl -n pl get deployments/vizier-cloud-connector -o yaml | grep image:
-# Pull cloud connector image and cp the binary from the container
-$ docker pull gcr.io/pixie-oss/pixie-prod/vizier-cloud_connector_server_image:0.14.15
-$ container_id=$(docker create gcr.io/pixie-oss/pixie-prod/vizier-cloud_connector_server_image:0.14.15)
-
-$ docker cp ${container_id}:/app/src/vizier/services/cloud_connector/cloud_connector_server.runfiles/px/src/vizier/services/cloud_connector/cloud_connector_server_/cloud_connector_server ./application_binary
 ```
-- Collect the pprof data through Pixie -- `px run -f pprof_export.pxl -o json > input.json`
-- Convert the JSON file into a binary pprof file that Dagger can use -- `./convert-flame-graph-hex-to-binary.sh input.json input.pprof`
-- Run Dagger to transform the input into a PGO compatible profile -- `dagger call -d  copy-file --pprof=input.pprof  export --path processed.pprof`
+dagger call create-pgo-profile --gcloud-config ~/.config/gcloud  --kubeconfig ~/.kube/config --api-key 'env:PX_API_KEY' --deployment-name 'pl/vizier-cloud-connector' --cloud-addr='testing.getcosmic.ai:443' --container-name=app export --path output.pprof
+```
 - View Dagger trace to see that the pprof functions are being annotated properly (see logs collected from adhoc run)
 
 ```

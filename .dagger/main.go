@@ -1,4 +1,4 @@
-// A generated module for HelloDagger functions
+// A generated module for PixieModule functions
 //
 // This module has been generated via dagger init and serves as a reference to
 // basic module structure as you get started with Dagger.
@@ -25,24 +25,32 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/pprof/profile"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 	"px.dev/pxapi"
 	"px.dev/pxapi/types"
 )
 
 const (
 	goAppBinary    = "application_binary"
+	inputFilepath  = "input.pprof"
 	outputFilepath = "output.pprof"
-	containerImage = "gcr.io/pixie-oss/pixie-prod/vizier-cloud_connector_server_image:0.14.15"
 	pxlTmpl        = `
 import px
 
 stack_traces = px.DataFrame(table='stack_traces.beta', start_time='-5m')
 stack_traces.deployment = stack_traces.ctx['deployment']
+stack_traces.container = stack_traces.ctx['container']
 # Filter out stack traces to just the go service we are trying to deploy
 stack_traces = stack_traces[stack_traces.deployment == '%s']
+# TODO(ddelnano): Add ability to filter by container name via Dagger function
+stack_traces = stack_traces[stack_traces.container == "app"]
 stack_traces.asid = px.asid()
 sample_period = px.GetProfilerSamplingPeriodMS()
 df = stack_traces.merge(sample_period, how='inner', left_on=['asid'], right_on=['asid'])
@@ -95,10 +103,106 @@ func (m *PprofMuxer) HandleDone(ctx context.Context) error {
 	return nil
 }
 
-// TODO(ddelnano): Rename module
-type HelloDagger struct{}
+func GetFirstHealthyVizier(client *pxapi.Client, ctx context.Context) (string, error) {
+	viziers, err := client.ListViziers(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to list viziers: %v", err)
+	}
 
-func (m *HelloDagger) CollectProfile(
+	for _, vizier := range viziers {
+		if vizier.Status == pxapi.VizierStatusHealthy {
+			return vizier.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("no healthy viziers found")
+}
+
+func (m *PixieModule) GetImageFromDeployment(ctx context.Context, gcloud_config *dagger.Directory, kubeconfig *dagger.File, deploymentName, containerName string) (string, error) {
+	gcloud_config.Export(ctx, "gcloud_config")
+	kubeconfig.Export(ctx, "config")
+	kubectlContainer := dag.Container().
+		From("google/cloud-sdk:alpine").
+		WithExec([]string{"gcloud", "components", "install", "kubectl", "gke-gcloud-auth-plugin", "--quiet"}).
+		WithFile("/root/.kube/config", kubeconfig, dagger.ContainerWithFileOpts{Permissions: 444, Expand: true}).
+		WithDirectory("/root/.config/gcloud", gcloud_config, dagger.ContainerWithDirectoryOpts{Expand: true})
+
+	deploymentParts := strings.Split(deploymentName, "/")
+	if len(deploymentParts) != 2 {
+		return "", fmt.Errorf("deployment name must be in the format 'namespace/deploymentName', got: %s", deploymentName)
+	}
+
+	ns, name := deploymentParts[0], deploymentParts[1]
+
+	var cmd []string
+	if containerName != "" {
+		cmd = []string{"kubectl", "get", "deployment", name, "-n", ns, "-o", fmt.Sprintf("jsonpath={.spec.template.spec.containers[?(@.name=='%s')].image}", containerName)}
+	} else {
+		cmd = []string{"kubectl", "get", "deployment", name, "-n", ns, "-o", "jsonpath={.spec.template.spec.containers[0].image}"}
+	}
+
+	result, err := kubectlContainer.WithExec(cmd).Stdout(ctx)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get deployment image: %v", err)
+	}
+
+	image := strings.TrimSpace(result)
+	if image == "" {
+		if containerName != "" {
+			return "", fmt.Errorf("container '%s' not found in deployment %s", containerName, deploymentName)
+		}
+		return "", fmt.Errorf("no containers found in deployment %s", deploymentName)
+	}
+
+	return image, nil
+}
+
+func GetImageFromDeployment(ctx context.Context, deploymentName, containerName string) (string, error) {
+	var kubeconfig string
+	if home := homedir.HomeDir(); home != "" {
+		kubeconfig = filepath.Join(home, ".kube", "config")
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to build kubeconfig: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Kubernetes clientset: %v", err)
+	}
+
+	deploymentParts := strings.Split(deploymentName, "/")
+	if len(deploymentParts) != 2 {
+		return "", fmt.Errorf("deployment name must be in the format 'namespace/deploymentName', got: %s", deploymentName)
+	}
+
+	ns, name := deploymentParts[0], deploymentParts[1]
+	deployment, err := clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get deployment %s: %v", deploymentName, err)
+	}
+
+	if len(deployment.Spec.Template.Spec.Containers) > 1 {
+		if containerName == "" {
+			return "", fmt.Errorf("deployment %s has multiple containers, please specify a container name", deploymentName)
+		}
+
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			if container.Name == containerName {
+				return container.Image, nil
+			}
+		}
+	}
+
+	return deployment.Spec.Template.Spec.Containers[0].Image, nil
+}
+
+type PixieModule struct{}
+
+func (m *PixieModule) CollectProfile(
 	ctx context.Context,
 	// +default="getcosmic.ai:443"
 	cloudAddr,
@@ -106,7 +210,6 @@ func (m *HelloDagger) CollectProfile(
 	deploymentName string,
 	apiKey *dagger.Secret,
 ) (*dagger.File, error) {
-	fmt.Println("CollectProfile called with pxCloudAddr:", cloudAddr, "and deploymentName:", deploymentName)
 	apiKeyPlaintext, err := apiKey.Plaintext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get plaintext API key: %v", err)
@@ -115,6 +218,14 @@ func (m *HelloDagger) CollectProfile(
 	client, err := pxapi.NewClient(ctx, pxapi.WithCloudAddr(cloudAddr), pxapi.WithAPIKey(apiKeyPlaintext))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Pixie API client: %v", err)
+	}
+
+	if vizierId == "" {
+		vizierId, err = GetFirstHealthyVizier(client, ctx)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get first healthy Vizier: %v", err)
+		}
 	}
 
 	vzClient, err := client.NewVizierClient(ctx, vizierId)
@@ -140,9 +251,9 @@ func (m *HelloDagger) CollectProfile(
 
 	pprofHex := <-pprof
 
-	// TODO(ddelnano): The pxl script converts the pprof binary into hex, resulting in
-	// this Go code needing to decode the hex string. Investigate if we can avoid this
-	// and have the pxapi return the pprof binary directly.
+	// TODO(ddelnano): The pxl script converts the pprof column from raw binary into hex.
+	// This necessitates decoding the hex string back into binary. Investigate if we can
+	// avoid this and have the pxapi return the pprof binary directly.
 	cleaned := strings.ReplaceAll(pprofHex, "\\x", "")
 	bytes, err := hex.DecodeString(cleaned)
 
@@ -159,7 +270,22 @@ func (m *HelloDagger) CollectProfile(
 	return pprofFile, nil
 }
 
-func (m *HelloDagger) GetApplicationBinary(ctx context.Context, containerImage string) (*dagger.File, error) {
+func (m *PixieModule) GetApplicationBinary(
+	ctx context.Context,
+	gcloudConfig *dagger.Directory,
+	kubeconfig *dagger.File,
+	deploymentName,
+	containerName string,
+) (*dagger.File, error) {
+	fmt.Println("Getting application binary for deployment:", deploymentName, "and container:", containerName)
+	containerImage, err := m.GetImageFromDeployment(ctx, gcloudConfig, kubeconfig, deploymentName, containerName)
+	fmt.Println("Container image: ", containerImage)
+
+	if err != nil {
+		fmt.Println("Error getting container image:", err)
+		return nil, fmt.Errorf("failed to get container image from deployment: %v", err)
+	}
+
 	entrypoints, err := dag.Container().
 		From(containerImage).
 		Entrypoint(ctx)
@@ -177,22 +303,35 @@ func (m *HelloDagger) GetApplicationBinary(ctx context.Context, containerImage s
 		File(entrypoints[0]), nil
 }
 
-// TODO(ddelnano): Remove CopyFile to something more meaningful
-func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File) (*dagger.File, error) {
-	pprof.Export(ctx, "input.pprof")
-	binary, err := m.GetApplicationBinary(ctx, containerImage)
+func (m *PixieModule) CreatePgoProfile(
+	ctx context.Context,
+	gcloudConfig *dagger.Directory,
+	kubeconfig *dagger.File,
+	// +default="getcosmic.ai:443"
+	cloudAddr,
+	// +default=""
+	vizierId,
+	deploymentName,
+	// +default=""
+	containerName string,
+	apiKey *dagger.Secret,
+) (*dagger.File, error) {
+	pprof, err := m.CollectProfile(ctx, cloudAddr, vizierId, deploymentName, apiKey)
+	pprof.Export(ctx, inputFilepath)
+	binary, err := m.GetApplicationBinary(ctx, gcloudConfig, kubeconfig, deploymentName, containerName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	binary.Export(ctx, goAppBinary)
 
-	info, err := buildinfo.ReadFile(goAppBinary)
+	fmt.Printf("Processing pprof file: %s\n", inputFilepath)
+	_, err = buildinfo.ReadFile(goAppBinary)
 
 	if err != nil {
 		// Container binary is not a Go binary, this pprof module is not applicable.
 		log.Fatal(err)
 	}
-	fmt.Printf("Build info go version: %s\n", info.GoVersion)
+	// fmt.Printf("Build info go version: %s\n", info.GoVersion)
 
 	var (
 		textStart = uint64(0)
@@ -201,7 +340,7 @@ func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File) (*dagger
 		pclntab []byte
 	)
 
-	file, err := os.Open("input.pprof")
+	file, err := os.Open(inputFilepath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -262,10 +401,25 @@ func (m *HelloDagger) CopyFile(ctx context.Context, pprof *dagger.File) (*dagger
 	tab, err := gosym.NewTable(symtab, gosym.NewLineTable(pclntab, textStart))
 
 	for _, f := range p.Function {
+
+		// Skip functions that are not relevant for PGO or are not Go functions.
+		// [k] indicates kernel functions, [m] indicates shared library code, and 0x indicates
+		// addresses that weren't symbolized.
+
+		if strings.HasPrefix(f.Name, "[k] ") ||
+			strings.HasPrefix(f.Name, "[m] ") ||
+			strings.HasPrefix(f.Name, "0x") ||
+
+			// Pixie's ELF based symbolizer recognizes these symbols but they don't
+			// exist in the .pclntab section, so we skip them. If/when Pixie has a .pclntab
+			// based symbolizer these symbols won't exist.
+			strings.HasPrefix(f.Name, "local.") {
+			continue
+		}
+
 		fnLookup := tab.LookupFunc(f.Name)
-		// This case happens when Pixie's symbolization fails to match what is expected in the
-		// .pclntab section. An example of this is kernel stack frames: "[k] do_sock_setsockopt"
-		// This shouldn't affect PGO.
+		// This case occurs when Pixie's symbolization, which is ELF based, fails to match what is expected in the
+		// .pclntab section.
 		if fnLookup == nil {
 			fmt.Printf("Function %s not found in symbol table\n", f.Name)
 		} else {
